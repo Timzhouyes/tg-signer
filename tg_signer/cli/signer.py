@@ -184,6 +184,7 @@ def tg_signer(
         "list-folders",
         "run",
         "run-once",
+        "status",
         "send-text",
         "logout",
     ]:
@@ -318,6 +319,24 @@ def run(obj, task_names, num_of_dialogs, folder):
 def run_once(obj, task_name, num_of_dialogs, folder):
     signer = get_signer(task_name, obj)
     run_worker(signer, signer.run_once(num_of_dialogs, folder=folder))
+
+
+@tg_signer.command(help="只读检查签到按钮状态（今日已签到/需要签到），不会点击按钮")
+@click.argument("task_name", default="my_sign")
+@click.option(
+    "--num-of-dialogs",
+    "-n",
+    "num_of_dialogs",
+    default=50,
+    show_default=True,
+    type=int,
+    help="未指定 --from-folder 时获取最近N个对话",
+)
+@from_folder_option
+@click.pass_obj
+def status(obj, task_name, num_of_dialogs, folder):
+    signer = get_signer(task_name, obj)
+    run_worker(signer, signer.check_status(num_of_dialogs, folder=folder))
 
 
 @tg_signer.command(help='发送一次文本消息, 请确保当前会话已经"见过"该`chat_id`')
