@@ -1417,3 +1417,109 @@ def test_normal_run_skips_username_resolution_errors_per_chat(signer_factory):
     asyncio.run(signer.normal_run(only_once=True))
 
     assert signed_chats == [123456]
+
+
+def _checkin_message(*button_texts):
+    return SimpleNamespace(
+        id=1,
+        chat=SimpleNamespace(id=123),
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton(t, callback_data=f"cb:{t}")] for t in button_texts]
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_click_keyboard_skips_when_done_text_present(signer_factory):
+    signer = signer_factory()
+    signer.request_callback_answer = AsyncMock(return_value=None)
+    message = _checkin_message("✅ 今日已打卡 (2天)", "积分福利商城")
+
+    ok = await signer._click_keyboard_by_text(
+        ClickKeyboardByTextAction(text="打卡", done_text="已打卡"), message
+    )
+
+    assert ok is True
+    signer.request_callback_answer.assert_not_awaited()
+    assert signer.context.sign_statuses == ["今日已签到"]
+
+
+@pytest.mark.asyncio
+async def test_click_keyboard_clicks_when_not_done(signer_factory):
+    signer = signer_factory()
+    signer.request_callback_answer = AsyncMock(return_value=None)
+    message = _checkin_message("📅 今日打卡", "积分福利商城")
+
+    ok = await signer._click_keyboard_by_text(
+        ClickKeyboardByTextAction(text="打卡", done_text="已打卡"), message
+    )
+
+    assert ok is True
+    signer.request_callback_answer.assert_awaited_once_with(
+        signer.app, 123, 1, "cb:📅 今日打卡"
+    )
+
+
+@pytest.mark.asyncio
+async def test_click_keyboard_status_only_does_not_click(signer_factory):
+    signer = signer_factory()
+    signer.request_callback_answer = AsyncMock(return_value=None)
+    signer.context.status_only = True
+    message = _checkin_message("📅 今日打卡")
+
+    ok = await signer._click_keyboard_by_text(
+        ClickKeyboardByTextAction(text="打卡", done_text="已打卡"), message
+    )
+
+    assert ok is True
+    signer.request_callback_answer.assert_not_awaited()
+    assert signer.context.sign_statuses == ["需要签到"]
+
+
+@pytest.mark.asyncio
+async def test_expected_account_mismatch_logs_out_and_aborts(
+    monkeypatch, signer_factory
+):
+    import tg_signer.core as core
+
+    monkeypatch.setenv("TG_EXPECTED_ACCOUNT", "telegrma tg")
+    log_out = AsyncMock(return_value=None)
+    monkeypatch.setattr(core.Client, "log_out", log_out)
+
+    async def other_account(self):
+        return SimpleNamespace(
+            id=999, username="someone_else", first_name="Other", last_name=None
+        )
+
+    patch_client_methods(monkeypatch, core, get_me=other_account)
+    signer = signer_factory()
+
+    with pytest.raises(RuntimeError, match="不一致"):
+        await signer.login(num_of_dialogs=20, print_chat=False)
+
+    log_out.assert_awaited_once()
+    assert signer.user is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "user",
+    [
+        {"id": 1, "username": "Telegrma_TG", "first_name": "x", "last_name": None},
+        {"id": 1, "username": None, "first_name": "Telegrma", "last_name": "TG"},
+    ],
+)
+async def test_expected_account_match_passes(monkeypatch, signer_factory, user):
+    import tg_signer.core as core
+
+    monkeypatch.setenv("TG_EXPECTED_ACCOUNT", "telegrma tg")
+
+    async def me(self):
+        return SimpleNamespace(**user)
+
+    patch_client_methods(monkeypatch, core, get_me=me)
+    signer = signer_factory()
+
+    await signer.login(num_of_dialogs=20, print_chat=False)
+
+    assert signer.user.id == 1

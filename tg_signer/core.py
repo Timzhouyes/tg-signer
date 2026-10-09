@@ -4,6 +4,7 @@ import logging
 import os
 import pathlib
 import random
+import re
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
@@ -122,6 +123,11 @@ def _get_inline_keyboard_buttons(message: Message) -> list[InlineKeyboardButton]
         for button in row
         if button.text
     ]
+
+
+def readable_user_brief(user: User) -> str:
+    name = " ".join(filter(None, [user.first_name, user.last_name]))
+    return f"{name} (@{user.username}, id={user.id})"
 
 
 def readable_chat(chat: Chat):
@@ -575,6 +581,7 @@ class BaseUserWorker(Generic[ConfigT]):
             if me is None:
                 async with app:
                     me = await self._call_telegram_api("users.GetFullUser", app.get_me)
+                    await self._ensure_expected_account(me)
 
                     async def load_latest_chats():
                         selected_folder = None
@@ -652,6 +659,36 @@ class BaseUserWorker(Generic[ConfigT]):
             else:
                 self.log("检测到同账号已完成登录初始化，复用已有会话信息")
             self.set_me(me)
+
+    async def _ensure_expected_account(self, me: User):
+        """若设置了环境变量`TG_EXPECTED_ACCOUNT`，登录账号必须与之匹配，否则中止。
+
+        可匹配用户名、显示名称或用户ID（忽略大小写、`@`、空格和下划线），
+        避免误用其他账号的session。不匹配时会登出刚创建的session。
+        """
+        expected = os.environ.get("TG_EXPECTED_ACCOUNT")
+        if not expected:
+            return
+
+        def norm(value) -> str:
+            return re.sub(r"[@\s_]", "", str(value or "")).lower()
+
+        candidates = {
+            norm(me.username),
+            norm(me.id),
+            norm(f"{me.first_name or ''}{me.last_name or ''}"),
+        }
+        candidates.discard("")
+        if norm(expected) in candidates:
+            self.log(f"账号校验通过: {readable_user_brief(me)}")
+            return
+        self.log("账号校验失败，已中止并登出当前session", level="ERROR")
+        await self.app.log_out()
+        _LOGIN_USERS.pop(self.app.key, None)
+        raise RuntimeError(
+            f"当前登录的账号与期望账号「{expected}」不一致"
+            f"（登录的是 {readable_user_brief(me)}），已中止。"
+        )
 
     async def logout(self):
         self.log("开始登出...")
@@ -858,6 +895,12 @@ class UserSignerWorkerContext(BaseModel):
         ],
     ]  # 收到的消息，key为(chat id, message_thread_id)
     waiting_message: Optional[Message]  # 正在处理的消息
+    status_only: bool = False  # 仅检查签到状态，不点击按钮
+    sign_statuses: list[str] = Field(default_factory=list)  # 按钮状态检查结果
+
+
+SIGN_STATUS_DONE = "今日已签到"
+SIGN_STATUS_NEED = "需要签到"
 
 
 class UserSigner(BaseUserWorker[SignConfigV3]):
@@ -949,7 +992,14 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
                     actions.append(SendDiceAction(dice=dice))
                 elif action == SupportAction.CLICK_KEYBOARD_BY_TEXT:
                     text_of_btn_to_click = local_input_("键盘中需要点击的按钮文本: ")
-                    actions.append(ClickKeyboardByTextAction(text=text_of_btn_to_click))
+                    done_text = local_input_(
+                        "表示今日已签到的按钮文本（出现该按钮则不再点击, 不需要直接回车）: "
+                    ).strip()
+                    actions.append(
+                        ClickKeyboardByTextAction(
+                            text=text_of_btn_to_click, done_text=done_text or None
+                        )
+                    )
                 elif action == SupportAction.CHOOSE_OPTION_BY_IMAGE:
                     print_to_user(
                         "图片识别将使用大模型回答，请确保大模型支持图片识别。"
@@ -1227,6 +1277,30 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
             self.log(f"下次运行时间: {next_run}")
             await asyncio.sleep((next_run - now).total_seconds())
 
+    async def check_status(self, num_of_dialogs=20, folder: Optional[str] = None):
+        """只读检查：执行发送文本等动作直到出现签到按钮，报告按钮状态但不点击。"""
+        if self.user is None:
+            await self.login(num_of_dialogs, print_chat=False, folder=folder)
+        config = self.load_config(self.cfg_cls)
+        chat_ids = [c.chat_id for c in config.chats]
+        self.app.add_handler(MessageHandler(self.on_message, filters.chat(chat_ids)))
+        self.app.add_handler(
+            EditedMessageHandler(self.on_edited_message, filters.chat(chat_ids))
+        )
+        async with self.app:
+            self.context = self.ensure_ctx()
+            self.context.status_only = True
+            for chat in config.chats:
+                route_key = await self.resolve_chat_route_key(chat)
+                self.context.sign_chats[route_key].append(chat)
+                before = len(self.context.sign_statuses)
+                await self.sign_a_chat(chat)
+                statuses = self.context.sign_statuses[before:]
+                result = statuses[-1] if statuses else "未识别到签到按钮"
+                print_to_user(f"{chat.name or chat.chat_id}: {result}")
+                self.context.chat_messages[route_key].clear()
+                await asyncio.sleep(config.sign_interval)
+
     async def run_once(self, num_of_dialogs, folder: Optional[str] = None):
         return await self.run(
             num_of_dialogs,
@@ -1308,11 +1382,21 @@ class UserSigner(BaseUserWorker[SignConfigV3]):
     ):
         if reply_markup := message.reply_markup:
             if isinstance(reply_markup, InlineKeyboardMarkup):
-                flat_buttons = (b for row in reply_markup.inline_keyboard for b in row)
-                option_to_btn: dict[str, InlineKeyboardButton] = {}
-                for btn in flat_buttons:
-                    option_to_btn[btn.text] = btn
+                buttons = [b for row in reply_markup.inline_keyboard for b in row]
+                if action.done_text:
+                    for btn in buttons:
+                        if action.done_text in btn.text:
+                            self.log(
+                                f"按钮「{btn.text}」: {SIGN_STATUS_DONE}，无需点击"
+                            )
+                            self.context.sign_statuses.append(SIGN_STATUS_DONE)
+                            return True
+                for btn in buttons:
                     if action.text in btn.text:
+                        if self.context.status_only:
+                            self.log(f"按钮「{btn.text}」: {SIGN_STATUS_NEED}")
+                            self.context.sign_statuses.append(SIGN_STATUS_NEED)
+                            return True
                         self.log(f"点击按钮: {btn.text}")
                         await self.request_callback_answer(
                             self.app,

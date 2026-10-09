@@ -233,6 +233,8 @@ class ClickKeyboardByTextAction(SignAction):
         SupportAction.CLICK_KEYBOARD_BY_TEXT
     )
     text: str
+    # 键盘中出现包含该文本的按钮时，视为今日已签到：不再点击，直接判定动作完成
+    done_text: Optional[str] = None
 
 
 class ChooseOptionByImageAction(SignAction):
