@@ -1505,8 +1505,8 @@ async def test_expected_account_mismatch_logs_out_and_aborts(
 @pytest.mark.parametrize(
     "user",
     [
-        dict(id=1, username="Telegrma_TG", first_name="x", last_name=None),
-        dict(id=1, username=None, first_name="Telegrma", last_name="TG"),
+        {"id": 1, "username": "Telegrma_TG", "first_name": "x", "last_name": None},
+        {"id": 1, "username": None, "first_name": "Telegrma", "last_name": "TG"},
     ],
 )
 async def test_expected_account_match_passes(monkeypatch, signer_factory, user):
